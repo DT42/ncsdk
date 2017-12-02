@@ -1,0 +1,6 @@
+tk /usr/bin/ncsdk
+api/c/mvnc.h /usr/include/
+api/c/mvnc_deprecated.h /usr/include/
+api/c/libmvnc.so.0 /usr/lib/mvnc/
+fw/MvNCAPI.mvcmd /usr/lib/mvnc/
+udev/97-usbboot.rules /etc/udev/rules.d/

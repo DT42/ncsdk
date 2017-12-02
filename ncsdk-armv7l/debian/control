@@ -1,0 +1,19 @@
+Source: ncsdk
+Section: unknown
+Priority: optional
+Maintainer: Bofu Chen <bofu@dt42.io>
+Build-Depends: debhelper (>=9)
+Standards-Version: 3.9.6
+Homepage: https://github.com/movidius/ncsdk
+#Vcs-Git: git://anonscm.debian.org/collab-maint/ncsdk.git
+#Vcs-Browser: https://anonscm.debian.org/cgit/collab-maint/ncsdk.git
+
+Package: ncsdk
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Software Development Kit for the Neural Compute Stick
+ This Intel Movidius Neural Compute software developer kit (NCSDK) is
+ provided for users of the Intel Movidius Neural Compute Stick (Intel
+ Movidius NCS). It includes software tools, an API, and examples, so
+ developers can create software that takes advantage of the accelerated
+ neural network capability provided by the Intel Movidius NCS hardware.
