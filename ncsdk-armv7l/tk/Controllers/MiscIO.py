@@ -178,22 +178,30 @@ def run_myriad(blob, arguments, file_gen=False):
 
     if arguments.save_output is not None:
         myriad_output.tofile(arguments.save_output)
-    myriad_output = myriad_output.reshape(sz)
 
     if arguments.mode in [OperationMode.temperature_profile]:
         net.temperature_buffer = tempBuffer
 
-    if arguments.parser == Parser.Caffe:
-        if net.outputNeedsTransforming and len(myriad_output.shape) > 2:
-            if len(myriad_output.shape) == 4:
-                myriad_output = myriad_output.reshape(myriad_output.shape[1:])
-            if file_gen:
-                np.save(arguments.outputs_name + "_result.npy", myriad_output)
+    if net.outputIsSsdDetOut:
+        no_detections = int(myriad_output[0])
+        myriad_output = myriad_output[7 : (no_detections + 1) * 7]
+        myriad_output = myriad_output.reshape(no_detections, 7, 1)
+        if arguments.parser == Parser.Caffe:
             myriad_output = yxz_to_zyx(myriad_output)
-    elif arguments.parser == Parser.TensorFlow:
-        myriad_output = myriad_output.reshape(myriad_output.shape[1:])
     else:
-        throw_error(ErrorTable.ParserNotSupported, string)
+        myriad_output = myriad_output.reshape(sz)
+
+        if arguments.parser == Parser.Caffe:
+            if net.outputNeedsTransforming and len(myriad_output.shape) > 2:
+                if len(myriad_output.shape) == 4:
+                    myriad_output = myriad_output.reshape(myriad_output.shape[1:])
+                if file_gen:
+                    np.save(arguments.outputs_name + "_result.npy", myriad_output)
+                myriad_output = yxz_to_zyx(myriad_output)
+        elif arguments.parser == Parser.TensorFlow:
+            myriad_output = myriad_output.reshape(myriad_output.shape[1:])
+        else:
+            throw_error(ErrorTable.ParserNotSupported, string)
 
     if file_gen:
         np.save(arguments.outputs_name + "_result.npy", myriad_output)
@@ -237,10 +245,6 @@ def parse_img(path, new_size, raw_scale=1, mean=None, channel_swap=None):
         print("No Image Detected, Using Array of Ones")
         return np.ones(new_size)
 
-    lenet_8_special_case = False
-    if new_size == [1, 8, 28, 28]:
-        lenet_8_special_case = True
-
     if path.split(".")[-1].lower() in ["png", "jpeg", "jpg", "bmp", "gif"]:
 
         greyscale = True if new_size[2] == 1 else False
@@ -273,15 +277,8 @@ def parse_img(path, new_size, raw_scale=1, mean=None, channel_swap=None):
         throw_error(ErrorTable.InputFileUnsupported)
 
     if (len(data.shape) == 2):
-        if lenet_8_special_case:
-            # Hack for Lenet - Duplicate data 8 times :|
-            tmp = np.zeros((1, 8, data.shape[0], data.shape[1]))
-            tmp[0][:] = data
-            return tmp
-
-        else:
-            # Add axis for greyscale images (size 1)
-            data = data[:, :, np.newaxis]
+        # Add axis for greyscale images (size 1)
+        data = data[:, :, np.newaxis]
 
     data = skimage.transform.resize(data, new_size[2:])
     data = np.transpose(data, (2, 0, 1))

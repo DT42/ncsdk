@@ -206,3 +206,201 @@ def check_match(output, expected):
             sorted[4]]) else False
 
     return top1, top5
+
+def compare_ssd_preds(expected_pred, resulted_pred, conf_tol, coord_tol):
+    """
+    Compare 2 predictions outputed by the DetectionLayer output of the SSD network.
+    Prediction elements have the following meaning:
+    [image_id | label | confidence | xmin | ymin | xmax | ymax]
+
+    :param expected_pred: Expected prediction values.
+    :param resulted_pred: Resulted prediciton values.
+    :param conf_tol:  Tolerance for absolute diffrence between prediciton scores.
+    :param coord_tol: Tolerance for absolute diffrence between prediction bounding
+        box coordinates.
+    :return: Match score computed as mean of absolute differences for the
+        confidence, xmin, ymin, xmax and ymax fields. The score is np.inf if the
+        image_id or the class lable do not match or if the score or coordinate
+        absolute diffrence exceeds the specified tolerance. Lower is better.
+    """
+
+    e_img_id, e_label = expected_pred[0:2]
+    r_img_id, r_label = resulted_pred[0:2]
+
+    if(e_img_id != r_img_id or e_label != r_label):
+        # Image ID or class label does not match.
+        return np.inf
+
+    match_abs_diffs = np.abs(expected_pred[2:] - resulted_pred[2:])
+    match_score     = np.mean(match_abs_diffs)
+
+    conf_abs_diff = match_abs_diffs[0]
+    if(conf_abs_diff > conf_tol):
+        return np.inf
+
+    coords_abs_diff = match_abs_diffs[1:]
+    if((coords_abs_diff > coord_tol).any()):
+        return np.inf
+
+    return match_score
+
+def ssd_metrics(result, expected):
+    """
+    Compute metrics for DetectionOutput layer from the SSD Network.
+    The output is a 2D matrix(table) of floating point values of size
+    num_predicitons x 7. Each row is a prediction with the columns representing the
+    following fields:
+    [image_id | label | confidence | xmin | ymin | xmax | ymax]
+
+    :param result:   2D np array of resulted predictions.
+    :param expected: 2D np array of expected predictions.
+    :return: None
+    """
+
+    print_pass = OKGREEN + BOLD + "Pass" + NORMAL
+    print_fail = FAIL    + BOLD + "Fail" + NORMAL
+
+    # Test if we can apply the metric.
+    # The supported input shape is: [1, num_predictions, 7]
+    if(len(result.shape) != 3 or len(expected.shape) != 3 
+            or result.shape[0] != 1 or result.shape[2] != 7
+            or expected.shape[0] != 1 or expected.shape[2] != 7):
+        print(WARNING + "Invalid input for the SSD metric: " +
+                "Please choose another metric." + NORMAL)
+        return
+
+    # Tolerances are hardcoded for the moment. They can be added as prameters if
+    # required.
+    num_preds_tolerance        = 0.02
+    unmatched_tolerance        = 0.02
+    out_of_order_tolerance     = 0.10
+    multiple_matches_tolerance = 0.10
+    conf_tolerance             = 0.01
+    coord_tolerance            = 0.01
+
+    # Remove 1st axis it should be one.
+    result   = result[0]
+    expected = expected[0]
+
+    # Compare number of predictions.
+    num_preds_expected = expected.shape[0]
+    num_preds_resulted = result.shape[0]
+
+    percent_diff_num_preds = ((num_preds_resulted - num_preds_expected) /
+            num_preds_expected)
+    pass_total_preds_test  = percent_diff_num_preds <= num_preds_tolerance
+
+    # Try to match the resulted detections with the expected detections.
+    match_scores = np.zeros((num_preds_resulted, num_preds_expected))
+    for pred_i in range(0, num_preds_resulted):
+        for expect_i in range(0, num_preds_expected):
+            match_scores[pred_i, expect_i] = compare_ssd_preds(expected[expect_i, :],
+                    result[pred_i, :], conf_tolerance, coord_tolerance)
+
+    # Get the best matches.
+    best_match_idx = np.argmin(match_scores, 1)
+
+    matched = (np.zeros(num_preds_resulted) > 0)
+    for pred_i, match_i in enumerate(best_match_idx):
+        matched[pred_i] = np.isfinite(match_scores[pred_i, match_i])
+
+    num_matched       = np.sum(matched)
+    num_unmatched     = num_preds_resulted - num_matched
+    unmatched_percent = ((num_unmatched / num_preds_resulted) \
+            if num_preds_resulted != 0 else 1)
+    pass_unmatched_test = unmatched_percent <= unmatched_tolerance
+
+    num_out_of_order_matches = np.sum(np.logical_and(
+            (np.arange(num_preds_resulted) - best_match_idx) != 0, matched)) // 2
+    out_of_order_percent = (num_out_of_order_matches / num_matched) \
+            if num_matched != 0 else 1
+    pass_out_of_order_test = out_of_order_percent <= out_of_order_tolerance
+
+    num_multiple_matches     = num_matched - len(np.unique(best_match_idx[matched]))
+    multiple_matches_percent = (num_multiple_matches / num_matched) \
+            if num_matched != 0 else 1
+    pass_multiple_matches_test = multiple_matches_percent <= multiple_matches_tolerance
+
+    # Display results.
+    h0 = ("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n")
+    hr = ("-------------------------------RESULT---------------------------------\n")
+    he = ("------------------------------EXPECTED--------------------------------\n")
+    h1 = ("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n")
+
+    table_header = ("(idx, match) | num | label |  score  |  "
+                    + "_xmin_  _ymin_  _xmax_  _ymax_")
+    print_format_str = ("({0:> 3d}, {1:> 3d}  ) | {2:> 3d} | {3:> 5d} | " +
+        "{4:> 1.4f} | {5:> 1.4f} {6:> 1.4f} {7:> 1.4f} {8:> 1.4f}")
+
+    # Set index = -1 for unmatched predictions.
+    best_match_idx[np.logical_not(matched)] = -1
+    best_match_idx_expected = np.argmin(match_scores, 0)
+    for pred_i, match_i in enumerate(best_match_idx_expected):
+        if(np.isinf(match_scores[match_i, pred_i])):
+            best_match_idx_expected[pred_i] = -1
+
+    print(h0 + hr + h1 + table_header)
+    for pred_i in range(0, num_preds_resulted):
+        color_output = print_format_str
+        if(best_match_idx[pred_i] == -1):
+            color_output = FAIL + print_format_str + NORMAL
+        elif(best_match_idx[pred_i] != pred_i):
+            # Matched out of order but at least matched.
+            color_output = WARNING + print_format_str + NORMAL
+        elif(best_match_idx[pred_i] == pred_i):
+            # The condition is a bit superflous but just in case something really
+            # wrong happend.
+            color_output = OKGREEN + print_format_str + NORMAL
+
+        print(color_output.format(pred_i, best_match_idx[pred_i],
+            int(result[pred_i, 0]), int(result[pred_i, 1]), result[pred_i, 2],
+            result[pred_i, 3], result[pred_i, 4],
+            result[pred_i, 5], result[pred_i, 6]))
+
+    print(h0 + he + h1 + table_header)
+    for pred_i in range(0, num_preds_expected):
+        color_output = print_format_str
+        if(best_match_idx_expected[pred_i] == -1):
+            color_output = FAIL + print_format_str + NORMAL
+        elif(best_match_idx_expected[pred_i] != pred_i):
+            # Matched out of order but at least matched.
+            color_output = WARNING + print_format_str + NORMAL
+        elif(best_match_idx_expected[pred_i] == pred_i):
+            # The condition is a bit superflous but just in case something really
+            # wrong happend.
+            color_output = OKGREEN + print_format_str + NORMAL
+
+        print(color_output.format(pred_i, best_match_idx_expected[pred_i],
+            int(expected[pred_i, 0]), int(expected[pred_i, 1]), expected[pred_i, 2],
+            expected[pred_i, 3], expected[pred_i, 4],
+            expected[pred_i, 5], expected[pred_i, 6]))
+
+    # Display statistics
+    print("------------------------------------------------------------")
+    print("Statistics:")
+    print("------------------------------------------------------------")
+    print(("Predictions total: result = {0:>3d}/{1:>3d} expected, " +
+        "diff = {2:>+6.2%} (tolerance = {3:>6.2%}): " +
+        (print_pass if pass_total_preds_test else print_fail))
+        .format(num_preds_resulted, num_preds_expected, percent_diff_num_preds,
+            num_preds_tolerance))
+    print(("Predictions unmatched percentage:             " +
+        "       {0:> 6.2%} (tolerance = {1:>6.2%}): " +
+        (print_pass if pass_unmatched_test else print_fail))
+        .format(unmatched_percent, unmatched_tolerance))
+
+    print(("Predictions matched out of order percentage:  " +
+        "       {0:> 6.2%} (tolerance = {1:>6.2%}): " +
+        (print_pass if pass_out_of_order_test else print_fail))
+        .format(out_of_order_percent, out_of_order_tolerance))
+
+    print(("Predictions multiple matches percentage:      " +
+        "       {0:> 6.2%} (tolerance = {1:>6.2%}): " +
+        (print_pass if pass_multiple_matches_test else print_fail))
+        .format(multiple_matches_percent, multiple_matches_tolerance))
+    print("------------------------------------------------------------")
+
+    pass_full_test = not (pass_total_preds_test and pass_unmatched_test and \
+            pass_out_of_order_test and pass_multiple_matches_test)
+
+    return pass_full_test

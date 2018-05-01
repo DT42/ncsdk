@@ -26,6 +26,10 @@ def stage_as_label(stage):
         StageType.deconvolution: "deconv",
         StageType.reshape: "reshape",
         StageType.power: "power",
+        StageType.permute: "permute",
+        StageType.normalize: "normalize",
+        StageType.prior_box: "prior_box",
+        StageType.detection_output: "detection_output",
     }
     if stage in d:
         return d[stage]
@@ -120,6 +124,14 @@ def get_class_of_op(op):
         return "Deconvolution"
     elif op in [StageType.reshape]:
         return "Reshape"
+    elif op in [StageType.permute]:
+        return "Permute"
+    elif op in [StageType.normalize]:
+        return "Normalize"
+    elif op in [StageType.prior_box]:
+        return "PriorBox"
+    elif op in [StageType.detection_output]:
+        return "DetectionOutput"
     else:
         # print(op)
         return "Unknown"
@@ -186,6 +198,23 @@ def enum_as_dtype(e):
     if e == DataType.bit:
         return np.bit
 
+def dtype_as_enum(dtype):
+    """
+    Return the enum corresponding to the numpy dtype
+    :param dtype:
+    :return e:
+    """
+    dt_np2enum = {
+            np.dtype('float64') : DataType.fp64,
+            np.dtype('float32') : DataType.fp32,
+            np.dtype('float16') : DataType.fp16,
+            np.dtype('int64') : DataType.int64,
+            np.dtype('int32') : DataType.int32,
+            np.dtype('int16') : DataType.int16,
+            np.dtype('int8') : DataType.int8
+        }
+
+    return dt_np2enum[dtype]
 
 def throw_warning(e, extra=None):
     msg = "[Warning: " + str(e.value) + "] "

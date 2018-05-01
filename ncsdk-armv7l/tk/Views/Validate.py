@@ -137,6 +137,14 @@ def validation(
     :param filename: used to write csv for compare_matrices
     :return: exit code. 0 success, all others indicate failure
     """
+
+    # Since we always have 3 dimensions when the corresponding caffe output
+    # has less than 3 dimensions than those dimensions in Fathom are 1 and
+    # have to be squeezed but we should not squeeze the myriad output when
+    # caffe output has the last dimension = 1.
+    while(len(result.shape) > len(expected.shape) and result.shape[-1] == 1):
+        result = np.squeeze(result, len(result.shape) - 1)
+
     if validation_type == ValidationStatistic.accuracy_metrics:
         np.set_printoptions(precision=4, suppress=True)
         print("Result: ", result.shape)
@@ -167,6 +175,9 @@ def validation(
     elif validation_type == ValidationStatistic.class_check_broad:
         exit_code = significant_classification_check(
             result, expected, arguments.class_test_threshold, validation_type)
+        return exit_code
+    elif validation_type == ValidationStatistic.ssd_pred_metric:
+        exit_code = ssd_metrics(result, expected)
         return exit_code
     else:
         throw_error(ErrorTable.ValidationSelectionError)

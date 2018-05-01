@@ -28,7 +28,7 @@ set_trap
 echo "Movidius Neural Compute Toolkit Setup."
 
 MAKE_PROCS=`nproc`
-SUPPORTED_TF_VER=1.3.0
+SUPPORTED_TF_VER=1.4.0
 
 ################################ Supported OS check ########################################
 # XXX: Add all supported OSes check here. The rest should exit early.
@@ -329,10 +329,10 @@ function install_raspbian_python_dependencies
 	#Pillow already installed
 	#PyYAML already installed
 	exit_on_error "$PIP_PREFIX pip3 install $PIP_QUIET graphviz"
+	exit_on_error "$PIP_PREFIX pip3 install $PIP_QUIET --upgrade numpy==1.13.1"
 	exit_on_error "$SUDO_PREFIX apt-get $APT_QUIET install -y python3-h5py"
 	exit_on_error "$SUDO_PREFIX apt-get $APT_QUIET install -y python3-lxml"
 	exit_on_error "$SUDO_PREFIX apt-get $APT_QUIET install -y python3-matplotlib"
-	exit_on_error "$SUDO_PREFIX apt-get $APT_QUIET install -y python3-numpy"
 	exit_on_error "$SUDO_PREFIX apt-get $APT_QUIET install -y python3-protobuf" #warning, is only 3.0.0-9.  is this good enough???
 	exit_on_error "$SUDO_PREFIX apt-get $APT_QUIET install -y python3-dateutil"
 	exit_on_error "$PIP_PREFIX pip3 install $PIP_QUIET scikit-image"
@@ -394,17 +394,23 @@ function check_and_install_caffe()
 	CAFFE_SRC="https://github.com/BVLC/caffe.git"
 	CAFFE_VER="1.0"
 	CAFFE_DIR=bvlc-caffe
-	if [ $INTEL_CAFFE == 'yes' ] && [ "${OS_DISTRO,,}" == "ubuntu" ]; then
+	CAFFE_BRANCH=master
+	if [ $CAFFE_FLAVOR == "intel" ] && [ "${OS_DISTRO,,}" == "ubuntu" ]; then
 		CAFFE_SRC="https://github.com/intel/caffe.git"
 		CAFFE_VER="1.0.3"
 		CAFFE_DIR=intel-caffe
+	elif [ $CAFFE_FLAVOR == "ssd" ]; then
+		CAFFE_SRC="https://github.com/weiliu89/caffe.git"
+		CAFFE_VER=""
+		CAFFE_DIR=ssd-caffe
+		CAFFE_BRANCH=ssd
 	fi
 
 	python3 -c "import caffe" 2> /dev/null
 	if [ $? -eq 1 ]; then
 		echo "Caffe not found, installing caffe..."
 	else
-		if [ $INTEL_CAFFE == 'yes' ] && [ "${OS_DISTRO,,}" == "ubuntu" ]; then
+		if [ $CAFFE_FLAVOR == "intel" ] && [ "${OS_DISTRO,,}" == "ubuntu" ]; then
 			find_and_try_adjusting_symlinks
 
 			# Look for intel caffe specific operation to determine the version of caffe currently running
@@ -449,7 +455,7 @@ function check_and_install_caffe()
 		fi
 
 		eval git reset --hard HEAD $STDOUT_QUIET
-		eval git checkout $GIT_QUIET master $STDOUT_QUIET
+		eval git checkout $GIT_QUIET $CAFFE_BRANCH $STDOUT_QUIET
 		eval git branch -D fathom_branch &>/dev/null || true
 		eval git pull $STDOUT_QUIET
 	elif [ -d "caffe" ]; then
@@ -470,7 +476,14 @@ function check_and_install_caffe()
 	export PYTHONPATH=$env:"$SETUPDIR/caffe/python":$PYTHONPATH
 	# At this point, caffe *must* be a symlink
 	cd `readlink -f caffe`
-	eval git checkout $GIT_QUIET $CAFFE_VER -b fathom_branch $STDOUT_QUIET
+
+	if [ "$CAFFE_BRANCH" != "master" ]; then
+		eval git checkout $GIT_QUIET $CAFFE_BRANCH $STDOUT_QUIET
+	fi
+
+	if [ "$CAFFE_VER" != "" ]; then
+		eval git checkout $GIT_QUIET $CAFFE_VER -b fathom_branch $STDOUT_QUIET
+	fi
 
 	configure_caffe_options
 
@@ -590,8 +603,8 @@ $SUDO_PREFIX cp -r $DIR/version.txt $SETUPDIR/
 $SUDO_PREFIX cp -r $SDK_DIR/LICENSE $SETUPDIR/
 
 # Install python API
-$PIP_PREFIX pip3 install $PIP_QUIET $SDK_DIR/api
-$PIP_PREFIX pip install $PIP_QUIET $SDK_DIR/api
+$PIP_PREFIX pip3 install $PIP_QUIET --upgrade --force-reinstall $SDK_DIR/api
+$PIP_PREFIX pip install $PIP_QUIET --upgrade --force-reinstall $SDK_DIR/api
 
 echo "NCS Libraries have been installed in $INSTDIR/lib"
 if [ $INSTALL_TOOLKIT = 'yes' ]; then
