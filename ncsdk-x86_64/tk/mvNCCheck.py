@@ -46,6 +46,14 @@ def parse_args():
     parser.add_argument('-id', dest='expectedid', type=int, help='Expected output id for validation')
     parser.add_argument('-cs', dest='channel_swap', type=coords, default=(2,1,0), help="default: 2,1,0 for RGB-to-BGR; no swap: 0,1,2", nargs='?')
     parser.add_argument('-dn', dest='device_no', metavar='', type=str, nargs='?', help="Experimental flag to run on a specified stick.")
+    parser.add_argument('-of', dest='save_output', type=str, default=None,
+            help='File name for the myriad result output in numpy format.')
+    parser.add_argument('-rof', dest='save_ref_output', type=str, default=None,
+            help='File name for the reference result in numpy format')
+    parser.add_argument('-metric', dest = 'metric', type = str,
+            default = "top5", help = "Metric to be used for validation.\
+                    Options: top1, top5 or accuracy_metrics, ssd_pred_metric")
+    parser.add_argument('-ec', dest='explicit_concat', action='store_true', help='Force explicit concat')
     args = parser.parse_args()
     return args
 
@@ -73,7 +81,7 @@ class Arguments:
         self.raw_scale = 1
         self.mean = None
         self.channel_swap = None
-        self.explicit_concat = False
+        self.explicit_concat = extargs.explicit_concat
         self.acm = 0
         self.timer = None
         self.number_of_iterations = 2
@@ -130,10 +138,10 @@ def check_net(network, image, inputnode=None, outputnode=None, nshaves=1, inputs
     expected = np.load(args.outputs_name + "_expected.npy")
     result = np.load(args.outputs_name + "_result.npy")
     filename = str(args.outputs_name) + "_val.csv"
-    if args.exp_id is not None:
-        quit_code = validation(result, expected, args.exp_id, ValidationStatistic.top1, filename, args)
-    else:
-        quit_code = validation(result, expected, None, ValidationStatistic.top5, filename, args)
+
+    quit_code = validation(myriad_output, expected, args.exp_id,
+            ValidationStatistic[extargs.metric], filename, args)
+
     return quit_code
 
 if __name__ == "__main__":

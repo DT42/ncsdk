@@ -24,7 +24,6 @@ from Views.Graphs import *
 
 from linecache import getline
 
-
 class NetworkStage:
 
     def __init__(
@@ -64,6 +63,11 @@ class NetworkStage:
             new_y=0,
             new_c=0):
         self.changeName(name)
+
+        # Historically cocat layer was working only for axis1 i.e channels.
+        # Concat on axis 2 is available only for CaffeParser and concat_axis 
+        # needs to default to 1 in order not to break the TensorFlowParser.
+        self.concat_axis = 1
 
         # mvTensor cannot deal with such convolution, which is equivalent to fc
         if (op_type == StageType.convolution and op_x == 1 and op_y == 1
@@ -122,15 +126,21 @@ class NetworkStage:
 
         self.outputDimZ = k
         if self.op in [StageType.fully_connected_layer]:
-            self.inputDimX = 1
-            self.inputDimY = 1
-            self.inputDimZ = x * y * c
+            if self.inputDimX == 0:
+                #Flag that we don't want to flatten the input 2D matrix
+                self.inputDimX = 1
+                self.outputDimX = 1
+                self.outputDimY = self.inputDimY
+            else:
+                self.inputDimX = 1
+                self.inputDimY = 1
+                self.inputDimZ = x * y * c
 
-            self.tapDimX = 1
-            self.tapDimY = x * y * c
+                self.tapDimX = 1
+                self.tapDimY = x * y * c
 
-            self.outputDimX = 1
-            self.outputDimY = 1
+                self.outputDimX = 1
+                self.outputDimY = 1
 
         elif self.op in [StageType.convolution, StageType.depthwise_convolution, StageType.max_pooling, StageType.average_pooling]:
             if pad_type == PadStyle.tfsame:
@@ -215,10 +225,40 @@ class NetworkStage:
                 self.outputDimZ = x * y * \
                     c // (self.outputDimX * self.outputDimY)
 
-        elif self.op in [StageType.crop]:
+        elif self.op in [StageType.reorg]:
+            stride = opParams[0]
+            self.outputDimX = int(self.inputDimX / stride)
+            self.outputDimY = int(self.inputDimY / stride)
+            self.outputDimZ = int(self.inputDimZ * stride * stride)
+
+        elif self.op in [StageType.crop, StageType.permute]:
             self.outputDimX = new_x
             self.outputDimY = new_y
             self.outputDimZ = new_c
+        elif self.op in [StageType.prior_box] :
+            self.tapDimX = int(opParams[1])
+            self.tapDimY = int(opParams[0])
+
+            opParams = opParams[2:]
+            min_size_size = opParams[0]
+            max_size_size = opParams[1]
+            flip = int(opParams[4])
+            aspect_ratio_size = opParams[2]
+            aspect_ratio_size = aspect_ratio_size*2 if (flip) else aspect_ratio_size
+
+            num_priors = (1 + aspect_ratio_size) * min_size_size + max_size_size
+
+            self.outputDimX = 1
+            self.outputDimY = int(x * y * num_priors * 4)
+            self.outputDimZ = 2
+        elif self.op in [StageType.detection_output]:
+            self.outputDimX = 7
+            # output[0,0,0] = contains the number of detections.
+            # The rest of the elements on the first line are grabage.
+            # The detections start at the second line and span maximum new_y lines
+            # i.e. top_k lines at max.
+            self.outputDimY = new_y + 1
+            self.outputDimZ = 1
         else:
             self.outputDimX = x
             self.outputDimY = y
@@ -315,9 +355,13 @@ class NetworkStage:
         self.isconcat = False
 
     def addBias(self, bias):
-        self.bias = bias
-        if self.bias is not None:
-            self.postOp = StageType.bias
+        if bias is not None:
+            if self.bias is None:
+                self.bias = bias
+                self.postOp = StageType.bias
+            else:
+                self.bias = self.bias + bias
+
 
     def putBias(self):
         if self.bias is not None:
@@ -330,13 +374,15 @@ class NetworkStage:
             self.tapsPointer, self.tapsBufferIndex = get_buffer(
                 self.taps.astype(np.float16), self.datatype)
             self.tapsIndex = MemoryIndex.blob.value
+            if self.op == StageType.copy:   #In copy we are using taps as input
+                self.dataPointer = self.tapsPointer
+                self.dataIndex = self.tapsIndex
 
     def putOpParams(self):
         """ Puts the operation parameters in the blob buffer """
         if self.opParams is not None:
             self.opParamsPointer, self.opParamsBufferIndex = \
-                get_buffer(self.opParams, DataType.fp32)
-
+                get_buffer(self.opParams, dtype_as_enum(self.opParams.dtype))
             self.opParamsIndex = MemoryIndex.blob.value
 
     def changeName(self, new_name):
@@ -422,7 +468,8 @@ class NetworkStage:
         stage.dataPointer = stage.inputOffset + self.outputPointer      # Input Pointer
         stage.dataIndex = self.outputIndex
 
-        if stage.op != StageType.fully_connected_layer and not self.isconcat:
+        if (stage.op != StageType.fully_connected_layer and not self.isconcat
+                and self.op != StageType.reshape):
             stage.inputDimX, stage.inputDimY, stage.inputDimZ = self.outputDimX, self.outputDimY, self.outputDimZ
             stage.tapDimY = self.outputDimZ
         if stage.op in [StageType.max_pooling]:
@@ -454,45 +501,89 @@ class NetworkStage:
         concatenate the outputs into the same buffer
         """
 
-        z = sum([int(stage.unprocessed_k) for stage in stages])
-        x = int(stages[0].outputDimX)
-        y = int(stages[0].outputDimY)
+        # This check is almost irrelevant since there are other cases when the code
+        # fails and this is a hack not propper code.
+        for stage_i, stage in enumerate(stages):
+            if stage.concat_axis != stages[0].concat_axis:
+                raise Exception("A layer cannot be part of multiple concats")
 
-        concat_size = (y, x, z)
+        if(stages[0].concat_axis == 1):
+            z = sum([int(stage.unprocessed_k) for stage in stages])
+            x = int(stages[0].outputDimX)
+            y = int(stages[0].outputDimY)
 
-        dtype = stages[0].datatype
-        if lastlayer:
-            for stage in stages:
-                stage.isoutput = True
-            buffer = 0
-            buffer_index = MemoryIndex.output.value
-        elif stages[0].outputPointer == 0 and stages[0].outputIndex == MemoryIndex.none.value:
-            buffer, buffer_index = get_zero_buffer(
-                np.zeros(concat_size).astype(
-                    enum_as_dtype(dtype)), dtype)
+            concat_size = (y, x, z)
+
+            dtype = stages[0].datatype
+            if lastlayer:
+                for stage in stages:
+                    stage.isoutput = True
+                buffer = 0
+                buffer_index = MemoryIndex.output.value
+            elif stages[0].outputPointer == 0 and stages[0].outputIndex == MemoryIndex.none.value:
+                buffer, buffer_index = get_zero_buffer(np.zeros(concat_size).astype(enum_as_dtype(dtype)), dtype)
+            else:
+                buffer = stages[0].outputPointer
+                buffer_index = stages[0].outputIndex
+
+            concat_offset = 0
+
+            for s_num, stage in enumerate(stages):
+                offset_pointer = buffer
+
+                if(stage.outputPointer == 0):
+                    stage.outputPointer = offset_pointer + concat_offset*2  # TODO: REMOVE HARDCODED 2 For FP16 Size
+
+                stage.outputIndex = buffer_index
+
+                stage.concatResult = True
+                concat_offset += int(stage.outputDimZ)
+
+                stage.outputStrideX = z*2
+                stage.outputStrideY = z*2*stage.outputDimX
+                stage.tapStrideY = stage.outputDimZ * 2
+        elif stages[0].concat_axis == 2:
+
+            z = int(stages[0].outputDimZ)
+            y = sum([int(stage.outputDimY) for stage in stages])
+            x = int(stages[0].outputDimX)
+
+            concat_size = (y, x, z)
+
+            dtype = stages[0].datatype
+            if lastlayer:
+                for stage in stages:
+                    stage.isoutput = True
+                buffer = 0
+                buffer_index = MemoryIndex.output.value
+            elif stages[0].outputPointer == 0 and stages[0].outputIndex == MemoryIndex.none.value:
+                buffer, buffer_index = get_zero_buffer(np.zeros(concat_size).astype(enum_as_dtype(dtype)), dtype)
+            else:
+                buffer = stages[0].outputPointer
+                buffer_index = stages[0].outputIndex
+
+            concat_offset = 0
+
+            for s_num, stage in enumerate(stages):
+                offset_pointer = buffer
+
+                if(stage.outputPointer == 0):
+                    stage.outputPointer = offset_pointer + concat_offset*2  # TODO: REMOVE HARDCODED 2 For FP16 Size
+
+                stage.outputIndex = buffer_index
+
+                stage.concatResult = True
+                concat_offset += int(stage.outputDimY * stage.outputDimX * stage.outputDimZ)
+
         else:
-            buffer = stages[0].outputPointer
-            buffer_index = stages[0].outputIndex
-
-        concat_offset = 0
-
-        for s_num, stage in enumerate(stages):
-            offset_pointer = buffer
-
-            if(stage.outputPointer == 0):
-                stage.outputPointer = offset_pointer + concat_offset * 2
-            stage.outputIndex = buffer_index
-
-            stage.concatResult = True
-            concat_offset += int(stage.outputDimZ)
-
-            stage.outputStrideX = z * 2
-            stage.outputStrideY = z * 2 * stage.outputDimX
-            stage.tapStrideY = stage.outputDimZ * 2
+            # This check is almost irrelevant since there are other cases when the code
+            # fails and this is a hack not propper code.
+            raise Exception("Concat on axis {0} not implemented".format(stages[0].concat_axis))
 
     def attach_eltwise(self, parents):
         # Attach two parents to this elementwise operations layer
         # The second layer will be put in the weights pointer
+
 
         if hasattr(parents[0], '__iter__'):
             NetworkStage.concat(parents[0], False)
@@ -529,6 +620,55 @@ class NetworkStage:
             self.tapsIndex = parents[1].outputIndex
             parents[1].tail.append(self)
         return
+
+    def attach_multiple_bottoms(self, parents):
+        # Attach a layer with at most 3 bottoms.
+        # 1st bottom -> to input data pointer.
+        # 2nd bottom -> to weights data pointer.
+        # 3rd bottom -> to biases data pointer.
+
+        if(len(parents) > 3):
+            raise Exception("Layer with {0} inputs not supported".format(len(parents)))
+
+        for bottom_idx, bottom in enumerate(parents):
+            if hasattr(bottom, '__iter__'):
+                NetworkStage.concat(parents[bottom_idx], False)
+                parents[bottom_idx] = parents[bottom_idx][0]
+
+            if bottom == 0:
+                # This bottom is the input (ussualy named "data") to the network.
+                if bottom_idx == 0:
+                    self.dataPointer = 0
+                    self.dataIndex   = MemoryIndex.input.value
+                elif bottom_idx == 1:
+                    self.tapsPointer = 0
+                    self.tapsIndex   = MemoryIndex.input.value
+                else:
+                    self.biasPointer = 0
+                    self.biasIndex   = MemoryIndex.input.value
+            else:
+                # This bottom is the output of a layer.
+                if(parents[bottom_idx].outputIndex == 0):
+                    out_ptr, out_idx = get_zero_buffer(parents[bottom_idx].output, self.datatype)
+                    parents[bottom_idx].outputPointer = out_ptr
+                    parents[bottom_idx].outputIndex   = out_idx
+
+                if bottom_idx == 0:
+                    self.dataPointer = self.inputOffset + parents[bottom_idx].outputPointer
+                    self.dataIndex   = parents[bottom_idx].outputIndex
+                elif bottom_idx == 1:
+                    self.tapsPointer = parents[bottom_idx].outputPointer
+                    self.tapsIndex   = parents[bottom_idx].outputIndex
+                else:
+                    self.biasPointer = parents[bottom_idx].outputPointer
+                    self.biasIndex   = parents[bottom_idx].outputIndex
+
+        #parents[1].tail.append(self)
+        #return
+        for bottom_idx, bottom in reversed(list(enumerate(parents))):
+            if bottom != 0:
+                parents[bottom_idx].tail.append(self)
+                return
 
     def attach_several(self, parents):
         """
@@ -818,6 +958,9 @@ class NetworkStage:
                 ErrorTable.ConversionNotSupported,
                 self.storageOrder.name)
 
+        if 0:
+            self.data.tofile('InputTensor.bin')
+
         if recurse:
             for node in self.tail:
                 node.convert_inputs_outputs_to_yxz(recurse)
@@ -842,8 +985,10 @@ class NetworkStage:
                 self.taps = kchw_to_hwck(self.taps)
                 replace_buffer(self.taps, self.tapsBufferIndex, self.datatype)
             else:
-                if self.taps is None or get_class_of_op(
-                        self.op) == "FCL" or self.op == StageType.scale:
+                if (self.taps is None or
+                        get_class_of_op(self.op) == "FCL" or
+                        self.op == StageType.scale or
+                        self.op == StageType.normalize):
                     pass
                 else:
                     throw_error(
@@ -1015,6 +1160,9 @@ class NetworkStage:
         dot.node(self.unprocessed_name, table, shape="plaintext")
         if self.top is not None:
             for t in self.top:
+                if t is None:
+                    print(self.unprocessed_name, 'has no top')
+                    continue
                 if not isinstance(t, str):
                     for tt in t:
                         dot.edge(tt, self.unprocessed_name)

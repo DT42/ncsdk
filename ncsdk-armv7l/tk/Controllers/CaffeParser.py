@@ -87,7 +87,8 @@ def get_caffe_output_channels(layer, prev_output_shape, top, network):
     if isReshape(layer.type):
         return layer.reshape_param.shape[0]
     if (isPooling(layer.type) or isSoftMax(layer.type) or isLRN(layer.type) or
-            isSigmoid(layer.type) or isTanH(layer.type) or isPower(layer.type)):
+            isSigmoid(layer.type) or isTanH(layer.type) or isPower(layer.type) or
+            isNormalize(layer.type)):
         if top is not None:
             if (len(top) > 1):
                 sum_of_k_from_parents = 0
@@ -108,6 +109,13 @@ def get_caffe_output_channels(layer, prev_output_shape, top, network):
         return prev_output_shape[0] * \
             prev_output_shape[1] * prev_output_shape[2]
 
+    if isPermute(layer.type):
+        return prev_output_shape[layer.permute_param.order[1]-1]
+
+    if isPriorBox(layer.type):
+        return 1
+
+    # print("Parse Warning: Default OutputChannels being used.")
     return 1  # default case
 
 
@@ -228,6 +236,8 @@ def get_caffe_params(layer, blobs):
             return blobs[layer.name][0].data.astype(dtype=data_type), None
     elif isPReLU(layer.type):
         return None, blobs[layer.name][0].data
+    elif isNormalize(layer.type):
+        return blobs[layer.name][0].data.astype(dtype=data_type)
     else:
         return None, None
 
@@ -245,7 +255,10 @@ def caffe_apply_minor_op(network, layer, top):
         for prevlayer in top:
             if isReLU(layer.type):
                 applicable_node = network.search(prevlayer)
-                applicable_node.postOp = StageType.relu
+                if layer.relu_param.negative_slope == 0.0:
+                    applicable_node.postOp = StageType.relu
+                else:
+                    applicable_node.postOp = StageType.leaky_relu
                 applicable_node.post_param1 = layer.relu_param.negative_slope
             if isELU(layer.type):
                 applicable_node = network.search(prevlayer)
@@ -267,6 +280,48 @@ def caffe_apply_minor_op(network, layer, top):
     else:
         throw_error(ErrorTable.StageTypeNotSupported, layer.type)
 
+def create_input_layer(myriad_conf, arguments, network, input_shape, input_name):
+    node = NetworkStage(input_name,
+                      None,  # top
+                      StorageOrder.orderZYX,
+                      0,
+                      0,
+                      PadStyle.caffe,
+                      DataType.fp16,
+                      DataType.fp16,
+                      StageType.none,
+                      # Radix and stride
+                      1,
+                      1,
+                      1,
+                      1,
+                      # X, Y, Z
+                      input_shape[3],
+                      input_shape[2],
+                      input_shape[1],
+                      # fh, fw
+                      1,
+                      1,
+                      # Output Channels (K)
+                      input_shape[1],
+                      # Taps, Bias,
+                      None,
+                      TapsOrder.orderKCHW,
+                      None,
+                      # Pre and post ops
+                      None,
+                      StageType.none,
+                      None,
+                      0,
+                      0,
+                      None,
+                      myriad_conf,
+                      arguments,
+                      new_x=0,
+                      new_y=0,
+                      new_c=0)
+    network.attach(node)
+    return node   
 
 def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
     path = arguments.net_description
@@ -362,6 +417,12 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
     last_layer = None
     first_layer = None
     nlayers = len(layers)
+    
+    # Create input layer 
+    create_input_layer(myriad_conf, arguments, network, input_shape, input_bottom)
+    inshape = input_shape
+    prev_output_shape = [input_data[0].shape]
+    top = None
 
     # Check if last layer's "name" & "top" have same name
     for idx, layer in enumerate(layers):
@@ -436,10 +497,15 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
             else:
                 prev_output_shape = []
                 nodes = network.search_several(top)
+                if isConcat(layer.type):
+                    for node_i, node in enumerate(nodes):
+                        node.concat_axis = layer.concat_param.axis
+
                 # nodes is a list, which can contain nodes or list of nodes, in
                 # case of concat
                 if len(nodes) == 0:
                     throw_error(ErrorTable.GraphConstructionFailure, top)
+
                 for i, node in enumerate(nodes):
                     if node == 0:
                         throw_error(
@@ -450,12 +516,19 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
                         shape = node[0].output.shape
                         for i in range(len(node)):
                             if i > 0:
-                                if (shape[1] != node[i].output.shape[1] or
+                                if node[i].concat_axis == 1:
+                                    if (shape[1] != node[i].output.shape[1] or
                                         shape[2] != node[i].output.shape[2]):
-                                    throw_error(
-                                        ErrorTable.StageDetailsNotSupported, layer.name)
-                                shape = (
-                                    shape[0] + node[i].output.shape[0], shape[1], shape[2])
+                                        throw_error(ErrorTable.StageDetailsNotSupported, layer.name)
+                                    shape = (shape[0] + node[i].output.shape[0], shape[1], shape[2])
+                                elif node[i].concat_axis == 2:
+                                    if (shape[0] != node[i].output.shape[0] or
+                                        shape[2] != node[i].output.shape[2]):
+                                        throw_error(ErrorTable.StageDetailsNotSupported, layer.name)
+                                    shape = (shape[0], shape[1]+ node[i].output.shape[1], shape[2])
+                                else:
+                                    throw_error(ErrorTable.StageDetailsNotSupported, layer.name)
+
                         prev_output_shape.append(shape)
                     else:
                         prev_output_shape.append(node.output.shape)
@@ -464,12 +537,18 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
         if isEltwise(layer.type) or isConcat(layer.type):
             for i in range(len(prev_output_shape)):
                 if i > 0:
-                    if (inshape[1] != prev_output_shape[i][1] or
+                    if isEltwise(layer.type) or (isConcat(layer.type) and layer.concat_param.axis == 1):
+                        if (inshape[1] != prev_output_shape[i][1] or
                             inshape[2] != prev_output_shape[i][2]):
-                        throw_error(
-                            ErrorTable.StageDetailsNotSupported, layer.name)
-                    inshape = (
-                        max(inshape[0], prev_output_shape[i][0]), inshape[1], inshape[2])
+                                throw_error(ErrorTable.StageDetailsNotSupported, layer.name)
+                        inshape = (max(inshape[0], prev_output_shape[i][0]), inshape[1], inshape[2])
+                    else:
+                        # We have a concat on axis != 1. Most probably axis 2.
+                        if (inshape[0] != prev_output_shape[i][0] or
+                            inshape[2] != prev_output_shape[i][2]):
+                                throw_error(ErrorTable.StageDetailsNotSupported, layer.name)
+                        inshape = (inshape[0], max(inshape[1], prev_output_shape[i][1]), inshape[2])
+
         if isDropout(layer.type):
             continue
         if isBatchNorm(layer.type) or isScale(layer.type):
@@ -665,7 +744,15 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
             continue
 
         if isReshape(layer.type):
-            new_shape = layer.reshape_param.shape
+            if(len(layer.reshape_param.shape.dim) == 3):
+                new_shape_X = 1
+                new_shape_Y = layer.reshape_param.shape.dim[2]
+                new_shape_C = layer.reshape_param.shape.dim[1]
+            else:
+                new_shape_X = layer.reshape_param.shape.dim[3]
+                new_shape_Y = layer.reshape_param.shape.dim[2]
+                new_shape_C = layer.reshape_param.shape.dim[1]
+
             network.attach(
                 NetworkStage(layer.name,
                              top,
@@ -703,22 +790,183 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
                              None,
                              myriad_conf,
                              arguments,
-                             new_x=new_shape.dim[3],
-                             new_y=new_shape.dim[2],
-                             new_c=new_shape.dim[1])
+                             new_x = new_shape_X,
+                             new_y = new_shape_Y,
+                             new_c = new_shape_C)
             )
             last_layer = layer
             if layer.name == outputNodeName:
                 break
             continue
 
-        if isPower(layer.type):
-            power_params = np.array([(layer.power_param.shift,
-                                      layer.power_param.scale,
-                                      layer.power_param.power)],
-                                    dtype=np.dtype("<f4"))
+        if isPriorBox(layer.type):
+            params = np.array((prev_output_shape[1][1],     # img H
+                               prev_output_shape[1][2],     # img W
+                               len(layer.prior_box_param.min_size), 
+                               len(layer.prior_box_param.max_size),
+                               len(layer.prior_box_param.aspect_ratio),
+                               len(layer.prior_box_param.variance), 
+                               layer.prior_box_param.flip,
+                               layer.prior_box_param.clip),
+                               dtype=np.dtype("<f4"))
+            params = np.append(params, layer.prior_box_param.min_size[0:])
+            params = np.append(params, layer.prior_box_param.max_size[0:])
+            params = np.append(params, layer.prior_box_param.aspect_ratio[0:])
+            params = np.append(params, layer.prior_box_param.variance[0:])
+            if (layer.prior_box_param.HasField("step_w") and
+                    layer.prior_box_param.HasField("step_h")):
+                # We don't check for both step and step_h/step_h being set
+                # because caffe should yeld an error before this.
+                params = np.append(params, layer.prior_box_param.step_w)
+                params = np.append(params, layer.prior_box_param.step_h)
+            elif (layer.prior_box_param.HasField("step")):
+                params = np.append(params, layer.prior_box_param.step)
+                params = np.append(params, layer.prior_box_param.step)
+            else:
+                params = np.append(params, 0)
+                params = np.append(params, 0)
+            params = np.append(params, layer.prior_box_param.offset)
+            params = params.astype(dtype = np.dtype("<f4"))
 
-            power_node = NetworkStage(layer.name,
+            node = NetworkStage(layer.name, top, StorageOrder.orderZYX,
+                    0, 0, PadStyle.none,
+                    DataType.fp16, DataType.fp16,
+                    get_caffe_op_type(layer),            # op_type
+                    1, 1,                                # op_x, op_y, 
+                    1, 1,                                # sx, sy,
+                    inshape[2], inshape[1], inshape[0],  # X, Y, Z
+                    0, 0,                                # fw, fh
+                    get_caffe_output_channels(layer, inshape, top, network),
+                    None, None, None, # taps, taps_order, bias,
+                    None,             # Pre Op
+                    StageType.none,   # Post Op
+                    None,             # Post Op Param 1
+                    0,                # Post Op StrideX
+                    0,                # Post Op StrideX
+                    myriad_config=myriad_conf, args=arguments,
+                    opParams=params)
+
+            network.attach(node)
+
+            last_layer = layer
+            if layer.name == outputNodeName:
+                break
+            continue
+
+        if (isDetectionOutput(layer.type)):
+            detection_param = layer.detection_output_param
+
+            share_location = 1 if detection_param.share_location else 0
+
+            det_out_dtype = np.dtype("<i4, <i4, <i4, <f4, <i4, <i4, <i4, <f4, <i4, <f4")
+
+            op_params = np.array((detection_param.num_classes,
+                share_location,
+                detection_param.background_label_id,
+                detection_param.nms_param.nms_threshold,
+                detection_param.nms_param.top_k,
+                detection_param.code_type,
+                detection_param.keep_top_k,
+                detection_param.confidence_threshold,
+                detection_param.variance_encoded_in_target,
+                detection_param.nms_param.eta), det_out_dtype)
+
+            op_params = op_params.flatten()
+            op_params = op_params.view("<f4")
+
+            node = NetworkStage(layer.name, top, StorageOrder.orderZYX,
+                    0, 0, PadStyle.none,
+                    DataType.fp16, DataType.fp16,
+                    get_caffe_op_type(layer),
+                    1, 1,
+                    1, 1,
+                    inshape[2], inshape[1], inshape[0],  # X, Y, Z
+                    0, 0,
+                    get_caffe_output_channels(layer, inshape, top, network),
+                    taps, TapsOrder.orderKCHW, None,
+                    None,  # Pre Op
+                    StageType.none,  # Post Op
+                    None,  # Post Op Param 1
+                    0,  # Post Op StrideX
+                    0,  # Post Op StrideX
+                    0, myriad_conf, args=arguments,
+                    opParams=op_params, 
+                    new_y=detection_param.keep_top_k)
+
+            network.attach(node)
+
+            last_layer = layer
+            if layer.name == outputNodeName:
+                break
+            continue
+
+        if (isPower(layer.type) or 
+           isNormalize(layer.type) or 
+           isPermute(layer.type)):
+            taps = None
+            (new_x, new_y, new_c) = (0, 0, 0)
+            if isPower(layer.type):
+                op_params = np.array((layer.power_param.shift,
+                                   layer.power_param.scale,
+                                   layer.power_param.power),
+                                   dtype = np.dtype("<f4"))
+            elif isNormalize(layer.type):
+                op_params = np.array((layer.norm_param.across_spatial,
+                                   layer.norm_param.channel_shared),
+                                   dtype = np.dtype("int32"))
+                taps = get_caffe_params(layer, net.params)
+            elif isPermute(layer.type):
+                caffe_perm_ord = np.array(layer.permute_param.order[1:], dtype = "i4")
+                if(np.count_nonzero(caffe_perm_ord) != len(caffe_perm_ord)):
+                    raise Exception("Permute on batch axis is not supported. \
+                            Layer = {0}".format(layer.name))
+
+                perm_ord = np.arange(3)
+                # Caffe axis are NCHW(0,1,2,3). Myriad axis are CHW(0,1,2).
+                # Hence substract 1.
+                perm_ord[0 : len(caffe_perm_ord)] = caffe_perm_ord - 1
+                new_c, new_y, new_x = np.array(inshape)[perm_ord]
+
+                # Decode the caffe permute order to myriad permute order.
+                ord_decoder = np.array([2, 0, 1], dtype = "i4")
+                myriad_perm_ord = ord_decoder[np.roll(perm_ord, -1)]
+                op_params = np.array(myriad_perm_ord, dtype = "i4")
+
+            node = NetworkStage(layer.name, top, StorageOrder.orderZYX,
+                    0, 0, PadStyle.none,
+                    DataType.fp16, DataType.fp16,
+                    get_caffe_op_type(layer),
+                    1, 1,
+                    1, 1,
+                    inshape[2], inshape[1], inshape[0],  # X, Y, Z
+                    0, 0,
+                    get_caffe_output_channels(layer, inshape, top, network),
+                    taps, TapsOrder.orderKCHW, None,
+                    None,  # Pre Op
+                    StageType.none,  # Post Op
+                    None,  # Post Op Param 1
+                    0,  # Post Op StrideX
+                    0,  # Post Op StrideX
+                    0, myriad_conf, args=arguments, 
+                    new_x = new_x, new_y = new_y, new_c = new_c,
+                    opParams = op_params)
+
+            network.attach(node)
+
+            last_layer = layer
+            if layer.name == outputNodeName:
+                break
+            continue
+
+        if isSoftMax(layer.type):
+            softmax_param = np.array([(layer.softmax_param.axis)],
+                    dtype=np.dtype("<i4"))
+            if(softmax_param[0] not in (1, 2)):
+                throw_error(ErrorTable.StageTypeNotSupported,
+                        "Axis parameter value {0} for layer {1} of type {2}".format(
+                            softmax_param[0], layer.name, layer.type))
+
+            softmax_node = NetworkStage(layer.name,
                                       top,
                                       StorageOrder.orderZYX,
                                       0,
@@ -750,9 +998,9 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
                                       0,
                                       myriad_conf,
                                       args=arguments,
-                                      opParams=power_params)
+                                      opParams = softmax_param)
 
-            network.attach(power_node)
+            network.attach(softmax_node)
 
             last_layer = layer
             if layer.name == outputNodeName:
@@ -1042,7 +1290,7 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
                     # Taps need to be roated in the HW plane because caffe
                     # implements the deconvolution via convolution backward pass
                     # which does an 180deg rotation.
-                    taps = np.rot90(taps, 2, (2, 3))
+                    taps = taps[:,:,::-1,::-1]
                 bias = get_caffe_params(layer, net.params)[1]
                 prev = top
                 layername = layer.name
@@ -1161,6 +1409,9 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
         nodes = network.search_several(last_layer.bottom)
         NetworkStage.concat(nodes)
 
+    if(isDetectionOutput(last_layer.type)):
+        network.outputIsSsdDetOut = True
+
     if outputNodeName is not None:
         if inputNodeName is not None:
             # Ensure we have the same inputs for each method
@@ -1195,9 +1446,11 @@ def parse_caffe(arguments, myriad_conf, debug=False, file_gen=False):
         except BaseException:
             throw_error(ErrorTable.NoOutputNode, extra=net.blobs.keys())
 
-    network.outputTensor = net.blobs[outputNodeName].data.shape
-    if(len(network.outputTensor) == 4):
-        network.outputTensor = network.outputTensor[1:]
-        network.outputTensor = zyx_to_yxz_dimension_only(network.outputTensor)
+    caffe_output_shape = net.blobs[outputNodeName].data.shape
+    output_shape       = np.ones(3, dtype = "i4")
+    # Substract 1 because caffe output will (almost)always have the batch dimension.
+    output_shape_len   = len(caffe_output_shape) - 1
+    output_shape[0 : output_shape_len] = caffe_output_shape[1:]
+    network.outputTensor = zyx_to_yxz_dimension_only(output_shape)
 
     return network

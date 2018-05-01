@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 
 setup(
     name = "mvnc",
-    version = "1.10.01.00",
+    version = "1.12.00.01",
     author = "Intel Corporation",
     description = ("mvnc python api"),
     license="None",

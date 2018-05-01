@@ -25,7 +25,10 @@ from Models.NetworkStage import *
 from Models.EnumDeclarations import *
 from tensorflow.core.framework import graph_pb2
 from tensorflow.python.framework import ops
+from Controllers.TensorFlowPreproc import TFPreprocessor
+from Controllers.TensorFlowPreproc import PatternType
 
+sys.setrecursionlimit(5000)
 placeholder_dict = {}
 const_dict = {}
 node_dict = {}
@@ -69,6 +72,28 @@ def valid_padding(in_dim, kernel_dim, stride_dim):
 
     return output_dim, pad
 
+def get_deconv_padding(input_shape, output_shape, kernel_shape, stride):
+    """
+    input_shape: N,H,W,C
+    output_shape: N,H,W,C
+    kernel_shape: kh,kw
+    stride: 1,sh,sw,sc
+    """
+    pady = 0
+    padx = 0
+    # 2Xpad = stride X (input - 1) + kernel - out
+    pady = stride[1] * (input_shape[1] - 1) + kernel_shape[0] - output_shape[1]
+    padx = stride[2] * (input_shape[2] - 1) + kernel_shape[1] - output_shape[2]
+    if (pady % 2 == 1):
+        pady = -1
+    else:
+        pady = pady / 2
+    if (padx % 2 == 1):
+        padx = -1
+    else:
+        padx = padx / 2
+    return int(pady), int(padx)
+
 
 def get_input(name, fail=True):
     global placeholder_dict
@@ -105,7 +130,7 @@ def get_input(name, fail=True):
                 if idn[1] == inputnode:
                     return None
                 if get_input(idn[1], False) == 0:
-                    return [idn[1]]
+                    return 0
                 return get_input(idn[1])
 
     if name == inputnode:
@@ -146,8 +171,7 @@ def have_first_input(name):
 
 
 def strip_tensor_id(word):
-    return re.sub(':\d+', '', word)
-
+    return word.replace(':0', '').replace(':','#')
 
 # Count how many times we need this as an input
 def count_inputs(t):
@@ -159,8 +183,7 @@ def count_inputs(t):
                 count = count + 1
     return count
 
-
-def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
+def parse_tensor(arguments, myriad_conf, preprocess=True, debug=False, file_gen=False):
     global const_dict
     global placeholder_dict
     global node_dict
@@ -178,19 +201,29 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
     if input_node_name is not None:
         inputnode = input_node_name
 
-    debug = False
+    # debug = True
     with tf.Session() as sess:
         filetype = path.split(".")[-1]
         if filetype == 'pb':
             graph_def = graph_pb2.GraphDef()
             with open(path, 'rb') as f:
                 graph_def.ParseFromString(f.read())
-            tf.import_graph_def(graph_def)
+            tf.import_graph_def(graph_def, name="")
         else:
-            saver = tf.train.import_meta_graph(path)
+            saver = tf.train.import_meta_graph(path, clear_devices=True)
             if saver is not None:
-                saver.restore(sess, path[:path.rfind('.')])
+                weight_filename = arguments.net_weights
+                if weight_filename == None:
+                    weight_filename = path[:path.rfind('.')]
+                saver.restore(sess, weight_filename)
         graph = tf.get_default_graph()
+
+        preprocessor = None
+
+        if preprocess:
+            preprocessor = TFPreprocessor()
+            preprocessor.preprocess(graph)
+
         inputTensor = graph.get_tensor_by_name(inputnode + ':0')
         if output_node_name is None:
             output_node_name = 'output'
@@ -210,12 +243,21 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                          arguments.input_size[1],
                          arguments.input_size[0],
                          3]
+
+        if isinstance(shape, tf.TensorShape):
+            shape_list = shape.as_list()
+            # Tensorflow can have None in the batch size field of the
+            # input shape, if that is the case then set it to 1
+            if None == shape_list[0]:
+                shape_list[0] = 1
+                shape = shape_list
+                inputTensor.set_shape(shape)
+            elif None in shape:
+                throw_error(ErrorTable.TFNotEvaluated)
+
         if image is None or image == "Debug":
-            if (isinstance(shape, tf.TensorShape)):
-                shape = shape.as_list()
-                if None in shape:
-                    throw_error(ErrorTable.TFNotEvaluated)
             input_data = np.random.uniform(0, 1, shape)
+
             if debug:
                 print("Input image shape", shape)
         else:
@@ -231,7 +273,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
         network = Network("TensorFlow Network", input_data)
         arguments.network = network
 
-        res = outputTensor.eval(feed_dict={inputnode + ':0': input_data})
+        res = outputTensor.eval(feed_dict={inputnode + ':0' : input_data})
 
         prev_node = None
         prev_node_label = None
@@ -245,11 +287,52 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                 for a in node.outputs:
                     print("           OUT:", a.name)
             if not inputfound:
-                if have_first_input(node.name):
+                if have_first_input(strip_tensor_id(node.outputs[0].name)):
                     inputfound = True
                     if debug:
                         print('Starting to process')
                 continue
+
+            # Each layer can have a placeholder for the batch size.
+            for output_item in node.outputs:
+                item_shape = output_item.shape.as_list()
+                if len(item_shape) > 0 and \
+                        item_shape[0] == None:
+                    item_shape[0] = 1
+                    output_item.set_shape(item_shape)
+
+            if preprocessor:
+
+                pattern_found, current_pattern = preprocessor.pattern_found(node)
+
+                if pattern_found:
+                    if current_pattern.get_type() == PatternType.Completed:
+                        continue
+                    else:
+                        if current_pattern.get_type() == PatternType.LeakyReLU:
+                            if debug:
+                                print("LeakyRelu")
+
+                            if len(current_pattern.get_input_shape()) == 4:
+                                node.outputs[0].set_shape([current_pattern.get_input_shape()[0],
+                                                           current_pattern.get_input_shape()[1],
+                                                           current_pattern.get_input_shape()[2],
+                                                           current_pattern.get_output_shape()[3]])
+                            elif len(current_pattern.get_input_shape()) == 2:
+                                node.outputs[0].set_shape([current_pattern.get_input_shape()[0],
+                                                           current_pattern.get_input_shape()[1]])
+                            else:
+                                throw_error(ErrorTable.StageDetailsNotSupported, "Unsupported LeakyRelu Dimensions")
+
+                            prev_node.postOp = StageType.leaky_relu
+                            prev_node.post_param1 = current_pattern.get_param(0)
+                            prev_node.changeName(current_pattern.get_name())
+                            prev_node_label = strip_tensor_id(current_pattern.get_prev_name())
+                            node_dict[prev_node_label] = prev_node
+                        else:
+                            throw_error(ErrorTable.StageDetailsNotSupported,
+                                        "Pattern not supported " + str(current_pattern.get_type().name))
+
             if node.type == "Const":
                 const_dict[node.name] = node.outputs[0].get_shape()
             elif node.type == "Placeholder":
@@ -284,9 +367,6 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                                              stride[2])[0],
                                outputs[3]]
 
-                if debug:
-                    print(output_size)
-
                 node.outputs[0].set_shape(output_size)
 
                 top, padding = get_padding_input(strip_tensor_id(inputs.name))
@@ -314,7 +394,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                        int(input_shape[2]),
                        int(input_shape[3]))
 
-                prev_node = NetworkStage(node.name,
+                prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
                                          top,
                                          StorageOrder.orderYXZ,
                                          pady,
@@ -407,7 +487,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                        int(input_shape[3]))
 
                 taps2 = np.array(taps.eval())
-                prev_node = NetworkStage(node.name,
+                prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
                                          top,
                                          StorageOrder.orderYXZ,
                                          pady,
@@ -442,7 +522,89 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
 
                 # node_dict
                 cnt += 1
-            elif node.type == "BiasAdd":
+            elif node.type == "Conv2DBackpropInput":
+                inputs = node.inputs[2]
+                input_shape = inputs.get_shape()
+                # If the network does not have predetermined input shape, take
+                # if from input
+                if input_shape.dims is None and inputs.name == input_node_name + ':0':
+                    input_shape = input_data.shape
+                taps = node.inputs[1]
+                taps_shape = node.inputs[1].get_shape().as_list()
+                outputs = node.outputs[0].get_shape()
+
+                ksize = [taps_shape[0], taps_shape[1]]
+                stride = node.get_attr("strides")
+                output_size = node.inputs[0].eval()
+
+                node.outputs[0].set_shape(output_size)
+
+                top, padding = get_padding_input(strip_tensor_id(inputs.name))
+                pady, padx = get_deconv_padding(input_shape.as_list(), output_size, ksize, stride)
+                if pady < 0 or padx < 0:
+                    throw_error(ErrorTable.StageDetailsNotSupported, "Wrong deconvolution output shape.")
+
+                padstyle = PadStyle.caffe
+                if top is not None:
+                    if top == inputnode:
+                        top = None
+                    else:
+                        top = [top]
+                    pady = padding[1][0]
+                    padx = padding[2][0]
+                    input_shape = [
+                        input_shape[0],
+                        input_shape[1] - 2 * pady,
+                        input_shape[2] - 2 * padx,
+                        input_shape[3]]
+                else:
+                    top = get_input(strip_tensor_id(inputs.name))
+
+                xyz = (int(input_shape[1]),
+                       int(input_shape[2]),
+                       int(input_shape[3]))
+                tapval = taps.eval()
+                tapval = np.swapaxes(tapval, 2, 3)
+                tapval = tapval[::-1,::-1,:,:]
+                prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
+                                         top,
+                                         StorageOrder.orderYXZ,
+                                         pady,
+                                         padx,
+                                         padstyle,
+                                         DataType.fp16,
+                                         DataType.fp16,
+                                         StageType.deconvolution,
+                                         int(taps_shape[0]),
+                                         int(taps_shape[1]),
+                                         stride[1],
+                                         stride[2],
+                                         xyz[0],
+                                         xyz[1],
+                                         xyz[2],
+                                         int(taps_shape[0]),
+                                         int(taps_shape[1]),
+                                         int(taps_shape[2]),
+                                         np.array(tapval),
+                                         TapsOrder.orderHWCK,
+                                         None,
+                                         None,
+                                         None,
+                                         None,
+                                         0,
+                                         0,
+                                         myriad_config=myriad_conf,
+                                         args=arguments)
+                network.attach(prev_node)
+                prev_node_label = strip_tensor_id(node.outputs[0].name)
+                node_dict[prev_node_label] = prev_node
+
+                # node_dict
+                cnt += 1
+            elif (node.type == 'BiasAdd' or node.type == 'Add' and
+                get_input(strip_tensor_id(node.inputs[0].name), False) != 0 and
+                get_input(strip_tensor_id(node.inputs[1].name), False) == 0 and
+                len(node.inputs[0].get_shape()) != 1):
                 if debug:
                     print("BiasAdd")
                 inputs = node.inputs[0].get_shape()
@@ -458,13 +620,15 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                     throw_error(
                         ErrorTable.StageDetailsNotSupported,
                         "Unsupported Bias Dimensions")
-                prev_node.addBias(
-                    np.array(
-                        bias_data.eval()).astype(
-                        np.float16))
-                prev_node.changeName(node.name)
-
+                prev_node = network.search(strip_tensor_id(node.inputs[0].name))
+                bias = np.array(bias_data.eval())
+                if bias.size == 1:
+                    #bias is a constant, transform it to a vector
+                    prev_node.addBias( (np.ones(outputs) * bias).astype(np.float16) )
+                else:
+                    prev_node.addBias( bias.astype(np.float16) )
                 prev_node_label = strip_tensor_id(node.outputs[0].name)
+                prev_node.changeName(prev_node_label)
                 node_dict[prev_node_label] = prev_node
 
             elif node.type == "MaxPool":
@@ -500,7 +664,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                     xyz = (1, 1, int(input_shape[1]))
 
                 prev_node = NetworkStage(
-                    node.name,
+                    strip_tensor_id(node.outputs[0].name),
                     top,
                     StorageOrder.orderYXZ,
                     0,
@@ -551,9 +715,9 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                         "Unsupported ReLU Dimensions")
 
                 prev_node.postOp = StageType.relu
-                prev_node.changeName(node.name)
-
                 prev_node_label = strip_tensor_id(node.outputs[0].name)
+                prev_node.changeName(prev_node_label)
+
                 node_dict[prev_node_label] = prev_node
 
             elif node.type == "Relu6":
@@ -574,9 +738,9 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
 
                 prev_node.postOp = StageType.relu_x
                 prev_node.post_param1 = 6.0
-                prev_node.changeName(node.name)
-
                 prev_node_label = strip_tensor_id(node.outputs[0].name)
+                prev_node.changeName(prev_node_label)
+
                 node_dict[prev_node_label] = prev_node
 
             elif node.type == "LRN":
@@ -598,7 +762,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                                  node.get_attr("beta"),
                                  0], dtype=np.float16)
                 prev_node = NetworkStage(
-                    node.name,
+                    strip_tensor_id(node.outputs[0].name),
                     top,
                     StorageOrder.orderYXZ,
                     0,
@@ -645,9 +809,12 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                                            node.inputs[1].get_shape()[1]])
 
                 top = get_input(strip_tensor_id(inputs[0].name))
-                xyz = (1, 1, int(input_shape[1]))
+                if len(input_shape) == 2:
+                    xyz = (0, int(input_shape[0]), int(input_shape[1])) #0 is special flag for saying the input is 2D
+                else:
+                    xyz = (1, 1, int(input_shape[1]))
 
-                prev_node = NetworkStage(node.name,
+                prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
                                          top,
                                          StorageOrder.orderYXZ,
                                          0,
@@ -703,8 +870,10 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                 taps_shape = [1, 1, 1, 1]
                 stride = [1, 1, 1, 1]
                 pad = 0
+                opParams=None
                 if node.type == "Softmax":
                     stagetype = StageType.soft_max
+                    opParams = np.array([1], dtype=np.dtype("<i4"))  # softmax would be performed on C - axis
                 elif node.type == "Sigmoid":
                     stagetype = StageType.sigmoid
                 else:
@@ -715,9 +884,9 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                            int(input_shape[2]),
                            int(input_shape[3]))
                 else:
-                    xyz = (1, 1, int(input_shape[1]))
+                    xyz = (1, int(input_shape[0]), int(input_shape[1]))
 
-                prev_node = NetworkStage(node.name,
+                prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
                                          top,
                                          StorageOrder.orderYXZ,
                                          0,
@@ -745,7 +914,8 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                                          0,
                                          0,
                                          myriad_config=myriad_conf,
-                                         args=arguments)
+                                         args=arguments,
+                                         opParams=opParams)
 
                 network.attach(prev_node)
                 prev_node_label = strip_tensor_id(node.outputs[0].name)
@@ -785,7 +955,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                     xyz = (1, 1, int(input_shape[1]))
 
                 prev_node = NetworkStage(
-                    node.name,
+                    strip_tensor_id(node.outputs[0].name),
                     top,
                     StorageOrder.orderYXZ,
                     0,
@@ -846,7 +1016,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                 else:
                     xyz = (1, 1, int(input_shape[1]))
 
-                prev_node = NetworkStage(node.name,
+                prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
                                          top,
                                          StorageOrder.orderYXZ,
                                          0,
@@ -887,8 +1057,19 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                 inputs = node.inputs
                 input_shape = node.inputs[0].get_shape()
                 desired_shape = node.inputs[1].eval()
-                if desired_shape[0] == -1:
-                    desired_shape[0] = 1
+ 
+                # Check for -1 in desired_shape
+                if -1 in desired_shape:
+                     if desired_shape[desired_shape == -1].size > 1:
+                         throw(
+                             ErrorTable.StageDetailsNotSupported,
+                             "Illegal Reshape dimension")
+#                    desired_shape = np.reshape(input_shape.as_list(), desired_shape)[0]
+                     input_size = input_shape.num_elements()
+                     desired_size = np.product(desired_shape[desired_shape >= 0])
+                     negative_index = np.argmin(desired_shape)
+                     desired_shape[negative_index] = input_size / desired_size
+                    
                 node.outputs[0].set_shape(desired_shape)
                 reshape_tracker += [(strip_tensor_id(node.outputs[0].name),
                                      strip_tensor_id(inputs[0].name))]
@@ -918,16 +1099,75 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                     print("No OP")
                 pass
             elif (node.type == "Concat" or node.type == "ConcatV2") and not node.inputs[0].dtype.is_integer:
+                explicit = False
+                #If at least one input is const, do explicit concat
+                for i in range(0, len(node.inputs)-1):
+                    if get_input(strip_tensor_id(node.inputs[i].name), False) == 0:
+                        explicit = True
+                        break
+                if explicit or arguments.explicit_concat:
+                    if debug:
+                        print('Explicit concat')
+                    if node.type == 'Concat':
+                        axis_select = node.inputs[0].eval()
+                        input_indices = range(1, len(node.inputs))
+                    else:
+                        axis_select = node.inputs[-1].eval()
+                        input_indices = range(0, len(node.inputs) - 1)
+                    outstride = 0
+                    for idx in input_indices:
+                        outstride += int(node.inputs[idx].get_shape()[axis_select])
+                    outstride *= 2
+
+                    for idx in input_indices:
+                        inshape = list(node.inputs[idx].get_shape())
+                        while len(inshape) < 4:
+                            inshape.insert(0,1)
+                        in_node = get_input(strip_tensor_id(node.inputs[idx].name), False)
+                        taps = None
+                        if in_node == 0:
+                            #Node not found, we assume it's a constant
+                            taps = np.array(node.inputs[idx].eval())
+                        prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name) + '_' + str(idx), [in_node] if in_node!=0 and in_node is not None else None, StorageOrder.orderYXZ,
+                            0, 0, PadStyle.none,
+                            DataType.fp16, DataType.fp16,
+                            StageType.copy,  # op_type
+                            1, 1,  # op_x, op_y,
+                            1, 1,  # sx, sy,
+                            int(inshape[1]), int(inshape[2]), int(inshape[3]),  # X, Y, Z
+                            0, 0, int(inshape[3]),
+                            taps, TapsOrder.orderHWCK, None,  # taps, taps_order, bias,
+                            None,  # Pre Op
+                            StageType.none,  # Post Op
+                            None,  # Post Op Param 1
+                            0,  # Post Op StrideX
+                            0,  # Post Op StrideX
+                            myriad_config=myriad_conf, args=arguments)
+                        network.attach(prev_node)
+                        #What follows will work only if axis_select is on the last index
+                        if idx == 0:
+                            outputPointer, outputIndex = prev_node.setoutput(outstride)
+                            prev_node_label = strip_tensor_id(node.outputs[0].name)
+                            node_dict[prev_node_label] = prev_node
+                        else:
+                            prev_node.setoutput(outstride, outputPointer, outputIndex)
+                        outputPointer = outputPointer + 2 * int(inshape[3])
+                        cnt += 1
+
+                    continue
                 if debug:
                     print("Concat")
                 concat_channel_size = 0
                 inputs = node.inputs
                 for src in inputs:
-                    if len(src.get_shape()) >= 4:
-                        concat_channel_size += int(src.get_shape()[3])
+                    dim = len(src.get_shape())-1
+                    if dim > 0:
+                        concat_channel_size += int(src.get_shape()[dim])
                 a_input = node.inputs[1].get_shape()
-                node.outputs[0].set_shape(
-                    [a_input[0], a_input[1], a_input[2], concat_channel_size])
+                if len(a_input) == 2:
+                    node.outputs[0].set_shape([a_input[0], concat_channel_size])
+                else:
+                    node.outputs[0].set_shape([a_input[0], a_input[1], a_input[2], concat_channel_size])
 
                 rep_arr = []
                 if node.type == 'Concat':
@@ -952,15 +1192,17 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                            int(input_shape[2]),
                            int(input_shape[3]))
                 else:
-                    xyz = (1, 1, int(input_shape[1]))
+                    xyz = (1, int(input_shape[0]), int(input_shape[1]))
                 if node.type == 'Add':
                     op = StageType.eltwise_sum
+                elif node.type == 'Mul' and node.inputs[1].shape[-1] == 1:
+                    op = StageType.scale_with_scalar
                 elif node.type == 'Mul':
                     op = StageType.eltwise_prod
                 else:
                     op = StageType.eltwise_max
                 prev_node = NetworkStage(
-                    node.name,
+                    strip_tensor_id(node.outputs[0].name),
                     top,
                     StorageOrder.orderYXZ,
                     0,
@@ -993,27 +1235,35 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                 prev_node_label = strip_tensor_id(node.outputs[0].name)
                 node_dict[prev_node_label] = prev_node
                 cnt += 1
-            elif (node.type == 'Mul' and prev_node_label is not None and
-                  (node.inputs[0].name == prev_node_label + ":0" or node.inputs[1].name == prev_node_label + ":0")):
+            elif ((node.type == 'Mul' or node.type == 'Div' or node.type == 'RealDiv') and prev_node_label is not None and
+                (strip_tensor_id(node.inputs[0].name) == prev_node_label or strip_tensor_id(node.inputs[1].name) == prev_node_label)):
                 # We are probably multiplying with a constant, try
-                iidx = 1 if node.inputs[1].name == prev_node_label + ":0" else 0
+                iidx = 1 if strip_tensor_id(node.inputs[1].name) == prev_node_label else 0
                 # Check if absorption is possible into a convolution, to be possible, we should use
                 # the convolution output only once, here
                 if prev_node.op == StageType.convolution and count_inputs(
                         prev_node_label + ":0") == 1:
                     if debug:
                         print('Mul with constant absorbed into convolution')
-                    prev_node.taps = np.multiply(
-                        prev_node.taps, node.inputs[1 - iidx].eval())  # Eval may fail
-                    if prev_node.bias is not None:
-                        prev_node.bias = np.multiply(
-                            prev_node.bias, node.inputs[1 - iidx].eval())  # Eval may fail
+                    if node.type == 'Mul':
+                        prev_node.taps = np.multiply(
+                            prev_node.taps, node.inputs[1 - iidx].eval())  # Eval may fail
+                        if prev_node.bias is not None:
+                            prev_node.bias = np.multiply(
+                                prev_node.bias, node.inputs[1 - iidx].eval())  # Eval may fail
+                    else:
+                        prev_node.taps = np.divide(
+                            prev_node.taps, node.inputs[1 - iidx].eval())  # Eval may fail
+                        if prev_node.bias is not None:
+                            prev_node.bias = np.divide(
+                                prev_node.bias, node.inputs[1 - iidx].eval())  # Eval may fail
+
                     node_dict[node.name] = node_dict[prev_node_label]
                     prev_node_label = node.name
-                    prev_node.name = prev_node.unprocessed_name + '/' + node.name
+                    prev_node.name = prev_node.unprocessed_name + '/' + strip_tensor_id(node.outputs[0].name)
                     prev_node.changeName(prev_node.name)
                     prev_node.alias.append(prev_node.unprocessed_name)
-                    prev_node.alias.append(node.name)
+                    prev_node.alias.append(strip_tensor_id(node.outputs[0].name))
                 else:
                     if debug:
                         print('Mul with constant')
@@ -1026,7 +1276,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                                int(input_shape[3]))
                     else:
                         xyz = (1, 1, int(input_shape[1]))
-                    prev_node = NetworkStage(node.name,
+                    prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
                                              top,
                                              StorageOrder.orderYXZ,
                                              0,
@@ -1060,7 +1310,8 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                     node_dict[prev_node_label] = prev_node
                     cnt += 1
 
-            elif node.type == 'Add' and prev_node_label is not None and node.inputs[0].name == prev_node_label + ":0":
+            elif (node.type == 'Add' or node.type == 'Sub') and prev_node_label is not None \
+                    and strip_tensor_id(node.inputs[0].name) == prev_node_label:
                 # We are probaby adding a constant bias, try
                 if debug:
                     print('Add (bias)')
@@ -1077,11 +1328,249 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                     throw_error(
                         ErrorTable.StageDetailsNotSupported,
                         "Unsupported Bias Dimensions")
-                prev_node.addBias(np.array(bias_data).astype(np.float16))
-                prev_node.changeName(node.name)
+                # Add scalar
+                if bias_data.ndim == 1 and bias_data.shape[0] == 1:
+                    # Populate bias array with data
+                    value = bias_data[0]
+                    bias_data = np.empty([int(outputs[3])])
+                    bias_data.fill(value)
 
+                if node.type == 'Add':
+                    prev_node.addBias(np.array(bias_data).astype(np.float16))
+                else:
+                    prev_node.addBias(np.array(-bias_data).astype(np.float16))
+
+                prev_node.changeName(node.name)
+                prev_node_label = strip_tensor_id(node.outputs[0].name)
+                prev_node.changeName(prev_node_label)
+
+                node_dict[prev_node_label] = prev_node
+            elif node.type == "Maximum":
+                if debug:
+                    print(node.type)
+                if prev_node_label == None:
+                    iidx = 0
+                else:
+                    iidx = 1 if node.inputs[1].name == prev_node_label + ":0" else 0
+                inputs = node.inputs[iidx]
+                input_shape = inputs.get_shape()
+                top = get_input(strip_tensor_id(inputs.name))
+                if len(input_shape) == 4:
+                    xyz = (int(input_shape[1]),
+                           int(input_shape[2]),
+                           int(input_shape[3]))
+                else:
+                    xyz = (1, 1, int(input_shape[1]))
+                prev_node = NetworkStage(node.name,
+                                         top,
+                                         StorageOrder.orderYXZ,
+                                         0,
+                                         0,
+                                         PadStyle.none,
+                                         DataType.fp16,
+                                         DataType.fp16,
+                                         StageType.max_with_const,
+                                         0,
+                                         0,
+                                         1,
+                                         1,
+                                         xyz[0],
+                                         xyz[1],
+                                         xyz[2],
+                                         0,
+                                         0,
+                                         xyz[2],
+                                         node.inputs[1 - iidx].eval(),
+                                         TapsOrder.orderHWCK,
+                                         None,
+                                         None,
+                                         None,
+                                         None,
+                                         0,
+                                         0,
+                                         myriad_config=myriad_conf,
+                                         args=arguments)
+                network.attach(prev_node)
                 prev_node_label = strip_tensor_id(node.outputs[0].name)
                 node_dict[prev_node_label] = prev_node
+                cnt += 1
+            elif (node.type == "Square" or node.type == "Rsqrt") and \
+                    (get_input(strip_tensor_id(node.inputs[0].name), False) != 0):
+                if debug:
+                    print(node.type)
+
+                inputs = node.inputs[0]
+                input_shape = node.inputs[0].get_shape()
+
+                outputs = node.outputs[0].get_shape()
+                if(len(input_shape) == 4):
+                    node.outputs[0].set_shape(
+                        [input_shape[0], input_shape[1], input_shape[2], outputs[3]])
+                elif(len(input_shape) == 2):
+                    node.outputs[0].set_shape([input_shape[0], input_shape[1]])
+                else:
+                    throw_error(
+                        ErrorTable.StageDetailsNotSupported,
+                        "Unsupported " + node.type + " dimensions")
+
+                top = get_input(strip_tensor_id(inputs.name))
+                if len(input_shape) == 4:
+                    xyz = (int(input_shape[1]),
+                           int(input_shape[2]),
+                           int(input_shape[3]))
+                else:
+                    xyz = (1, 1, int(input_shape[1]))
+                
+                if node.type == "Square":
+                    op_type = StageType.square
+                else:
+                    op_type = StageType.rsqrt
+                prev_node = NetworkStage(node.name,
+                                         top,
+                                         StorageOrder.orderYXZ,
+                                         0,
+                                         0,
+                                         PadStyle.none,
+                                         DataType.fp16,
+                                         DataType.fp16,
+                                         op_type,
+                                         0,
+                                         0,
+                                         1,
+                                         1,
+                                         xyz[0],
+                                         xyz[1],
+                                         xyz[2],
+                                         0,
+                                         0,
+                                         int(input_shape[1]),
+                                         None,
+                                         None,
+                                         None,
+                                         None,
+                                         None,
+                                         None,
+                                         0,
+                                         0,
+                                         myriad_config=myriad_conf,
+                                         args=arguments)
+
+                network.attach(prev_node)
+                prev_node_label = strip_tensor_id(node.outputs[0].name)
+                node_dict[prev_node_label] = prev_node
+
+                cnt += 1
+            elif node.type == "Sum":
+                if debug:
+                    print(node.type)
+
+                inputs = node.inputs[0]
+                input_shape = node.inputs[0].get_shape()
+
+                output_shape = node.outputs[0].get_shape()
+                axis = node.inputs[1].eval()
+                if axis != len(output_shape) - 1:
+                    throw_error(
+                        ErrorTable.StageDetailsNotSupported,
+                        "Unsupported " + node.type + " axis")
+                axis_param = np.array([axis, 0], dtype=np.float16)
+
+                top = get_input(strip_tensor_id(inputs.name))
+                if len(input_shape) == 4:
+                    xyz = (int(input_shape[1]),
+                           int(input_shape[2]),
+                           int(input_shape[3]))
+                else:
+                    xyz = (1, 1, int(input_shape[1]))
+
+                prev_node = NetworkStage(node.name,
+                                         top,
+                                         StorageOrder.orderYXZ,
+                                         0,
+                                         0,
+                                         PadStyle.none,
+                                         DataType.fp16,
+                                         DataType.fp16,
+                                         StageType.sum_reduce,
+                                         0,
+                                         0,
+                                         1,
+                                         1,
+                                         xyz[0],
+                                         xyz[1],
+                                         xyz[2],
+                                         0,
+                                         0,
+                                         1,
+                                         None,
+                                         None,
+                                         None,
+                                         None,
+                                         None,
+                                         None,
+                                         0,
+                                         0,
+                                         myriad_config=myriad_conf,
+                                         args=arguments,
+                                         opParams=axis_param)
+
+                network.attach(prev_node)
+                prev_node_label = strip_tensor_id(node.outputs[0].name)
+                node_dict[prev_node_label] = prev_node
+
+                cnt += 1
+            elif (node.type == 'FusedBatchNorm'  and prev_node_label is not None and
+                 len(node.inputs) == 5):
+                if debug:
+                    print('FusedBatchNorm')
+
+                # Fold the batchnorm into the weights
+                if prev_node.op == StageType.convolution or \
+                   prev_node.op == StageType.fully_connected_layer or \
+                   prev_node.op == StageType.depthwise_convolution:
+                    if debug:
+                        print('FusedBatchNorm absorbed into convolution')
+
+                    eps = node.get_attr('epsilon')
+                    scale_param = node.inputs[1].eval()
+                    offset = node.inputs[2].eval()
+                    mean = node.inputs[3].eval()
+                    var = node.inputs[4].eval()
+                    if len(mean) == 0 or len(var) == 0:
+                        throw_error(
+                            ErrorTable.StageDetailsNotSupported,
+                            "FusedBatchNorm inputs mean and variance are not defined.  The graph is not created for inference.")
+
+                    variance = var + eps
+                    scale = np.reciprocal(np.sqrt(variance)) * scale_param
+                    bias = offset - (mean * scale)
+                    scale = np.reshape(scale, [1, 1, 1, -1])
+                    bias = np.reshape(bias, [1, 1, 1, -1])
+                    if prev_node.op == StageType.depthwise_convolution:
+                       scale = np.swapaxes(scale,2,3)
+                       bias = np.swapaxes(bias,2,3)
+                    prev_node.taps = prev_node.taps * scale
+                    
+                    if prev_node.bias is not None:
+                        if bias is not None:
+                            prev_node.bias = prev_node.bias * scale + bias
+                        else:
+                            prev_node.bias = prev_node.bias * scale
+                    else:
+                        if bias is not None:
+                            prev_node.addBias(np.array(bias).astype(np.float16))
+
+                    node_dict[node.name] = node_dict[prev_node_label]
+                    prev_node_label = node.name
+                    prev_node.name = prev_node.unprocessed_name + '/' + node.name
+                    prev_node.changeName(prev_node.name)
+                    prev_node.alias.append(prev_node.unprocessed_name)
+                    prev_node.alias.append(node.name)
+                else:
+                    throw_error(
+                        ErrorTable.StageDetailsNotSupported,
+                        "FusedBatchNorm must be preceded by convolution or fully connected layer")
+                    
             elif node.type == 'Slice' and not node.inputs[0].dtype.is_integer:
                 if debug:
                     print('Slice')
@@ -1100,7 +1589,7 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                     (top, int(
                         slicingbegin[3]), int(
                         slicingbegin[3] + slicingsize[3])))
-                prev_node = NetworkStage(node.name,
+                prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
                                          top,
                                          StorageOrder.orderYXZ,
                                          0,
@@ -1134,6 +1623,208 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                 prev_node_label = strip_tensor_id(node.outputs[0].name)
                 node_dict[prev_node_label] = prev_node
                 cnt += 1
+            elif node.type == 'ExtractImagePatches':
+                if debug:
+                    print("ExtractImagePatches")
+
+                # Currently not supported, will be interpreted as reorg for yolo-v2
+                throw_error(ErrorTable.StageDetailsNotSupported, node.type)
+
+                '''
+                inputs = node.inputs[0]
+                input_shape = node.inputs[0].get_shape()
+                stride = node.get_attr("stride")
+
+                output_shape = [input_shape[0], tf.Dimension(int(input_shape[1]) / stride),
+                                tf.Dimension(int(input_shape[2]) / stride),
+                                tf.Dimension(int(input_shape[3]) * stride * stride)]
+
+                node.outputs[0].set_shape(output_shape)
+
+                top = get_input(strip_tensor_id(inputs.name))
+
+                op_node = NetworkStage(
+                    node.name + '_op',
+                    top,
+                    StorageOrder.orderYXZ,
+                    0,
+                    0,
+                    PadStyle.none,
+                    DataType.fp16,
+                    DataType.fp16,
+                    StageType.reorg,
+                    0,
+                    0,
+                    0,
+                    0,
+                    int(input_shape[1]),
+                    int(input_shape[2]),
+                    int(input_shape[3]),
+                    int(output_shape[1]),
+                    int(output_shape[2]),
+                    int(output_shape[3]),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    myriad_config=myriad_conf,
+                    args=arguments,
+                    opParams=np.array([stride], dtype=np.int32))
+                network.attach(op_node)
+                prev_node_label = node.name + '_op'
+                node_dict[prev_node_label] = prev_node
+
+                cnt += 1
+
+                prev_node = NetworkStage(
+                    node.name,
+                    [node.name + '_op'],
+                    StorageOrder.orderYXZ,
+                    0,
+                    0,
+                    PadStyle.none,
+                    DataType.fp16,
+                    DataType.fp16,
+                    StageType.copy,
+                    1,
+                    1,
+                    1,
+                    1,
+                    int(output_shape[1]),
+                    int(output_shape[2]),
+                    int(output_shape[3]),
+                    int(output_shape[1]),
+                    int(output_shape[2]),
+                    int(output_shape[3]),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    myriad_config=myriad_conf,
+                    args=arguments)
+                network.attach(prev_node)
+                prev_node_label = node.name
+                node_dict[prev_node_label] = prev_node
+
+                cnt += 1
+                '''
+            elif (node.type == 'StridedSlice') and not node.inputs[0].dtype.is_integer:
+                if debug:
+                    print('StridedSlice')
+                input_shape = node.inputs[0].get_shape()
+                slicingbegin = node.inputs[1].eval()
+                slicingsize = node.inputs[2].eval() - slicingbegin
+                slicingstride = node.inputs[3].eval()
+                begin_mask = node.get_attr('begin_mask')
+                end_mask = node.get_attr('end_mask')
+                ellipsis_mask = node.get_attr('ellipsis_mask')
+                new_axis_mask = node.get_attr('new_axis_mask')
+                shrink_axis_mask = node.get_attr('shrink_axis_mask')
+                if begin_mask != 5 or end_mask != 5 or ellipsis_mask != 0 or new_axis_mask != 0 or shrink_axis_mask != 2:
+                    throw_error(
+                        ErrorTable.StageDetailsNotSupported,
+                        "StridedSlice attributes not supported")
+                if (len(input_shape) != 3 or len(slicingbegin) != 3 or len(slicingsize) != 3 or len(slicingstride) != 3 or
+                        slicingsize[1] != 1 or slicingstride[0] != 1 or slicingstride[1] != 1 or slicingstride[2] != 1):
+                    throw_error(
+                        ErrorTable.StageDetailsNotSupported,
+                        "Slice type not supported")
+                top = get_input(strip_tensor_id(node.inputs[0].name))
+                curslicing = []
+                curslicing.append(
+                    (top, int(slicingbegin[1]) * int(input_shape[2]), (int(slicingbegin[1])+1) * int(input_shape[2]))
+                    )
+                prev_node = NetworkStage(strip_tensor_id(node.outputs[0].name),
+                                         top,
+                                         StorageOrder.orderYXZ,
+                                         0,
+                                         0,
+                                         PadStyle.none,
+                                         DataType.fp16,
+                                         DataType.fp16,
+                                         StageType.copy,
+                                         1,
+                                         1,
+                                         1,
+                                         1,
+                                         int(input_shape[0]),
+                                         int(input_shape[1]),
+                                         int(input_shape[2]),
+                                         1,
+                                         1,
+                                         int(input_shape[2]),
+                                         None,
+                                         TapsOrder.orderKCHW,
+                                         None,
+                                         None,
+                                         StageType.none,
+                                         None,
+                                         0,
+                                         0,
+                                         curslicing,
+                                         myriad_conf,
+                                         args=arguments)
+                network.attach(prev_node)
+                prev_node_label = strip_tensor_id(node.outputs[0].name)
+                node_dict[prev_node_label] = prev_node
+                cnt += 1
+            elif node.type == 'Split' and node.inputs[0].dtype.is_integer:
+                if debug:
+                    print('Split')
+                n = len(node.outputs)
+                dim = node.inputs[0].eval()
+                input_shape = node.inputs[1].get_shape()
+                size = int(input_shape[dim])
+                dim += 1
+                while dim < len(input_shape):
+                    size *= int(input_shape[dim])
+                    dim += 1
+                top = get_input(strip_tensor_id(node.inputs[1].name))
+                for i in range(n):
+                    curslicing = []
+                    curslicing.append((top[0] if top is not None else None, size//n * i, size//n * (i+1)))
+                    prev_node = NetworkStage(strip_tensor_id(node.outputs[i].name),
+                                             top,
+                                             StorageOrder.orderYXZ,
+                                             0,
+                                             0,
+                                             PadStyle.none,
+                                             DataType.fp16,
+                                             DataType.fp16,
+                                             StageType.copy,
+                                             1,
+                                             1,
+                                             1,
+                                             1,
+                                             1,
+                                             int(input_shape[0]),
+                                             int(input_shape[1]),
+                                             1,
+                                             1,
+                                             size//n,
+                                             None,
+                                             TapsOrder.orderKCHW,
+                                             None,
+                                             None,
+                                             StageType.none,
+                                             None,
+                                             0,
+                                             0,
+                                             curslicing,
+                                             myriad_conf,
+                                             args=arguments)
+                    network.attach(prev_node)
+                    prev_node_label = strip_tensor_id(node.outputs[i].name)
+                    node_dict[prev_node_label] = prev_node
+                    cnt += 1
             elif node.type == 'Pad':
                 if debug:
                     print('Pad')
@@ -1141,15 +1832,18 @@ def parse_tensor(arguments, myriad_conf, debug=False, file_gen=False):
                                      strip_tensor_id(node.inputs[0].name),
                                      node.inputs[1].eval())]
             elif (node.type == 'TruncatedNormal' or node.type == 'Assign' or
-                  node.type == 'RandomUniform' or node.type == 'Div' or node.type == 'Mul' or
+                  node.type == 'RandomUniform' or node.type == 'Div' or node.type == 'RealDiv' or node.type == 'Mul' or
                   node.type == 'Floor' or node.type == 'Add' or node.type == 'Sub' or
                   node.type == 'Rsqrt' or node.type == 'RandomStandardNormal' or
                   node.type == 'L2Loss' or node.type == 'Pack' or node.type == 'Slice' or
-                  node.type == 'Prod' or node.type == 'ExpandDims' or node.type == 'ConcatV2'):
+                  node.type == 'Prod' or node.type == 'ExpandDims' or node.type == 'ConcatV2' or
+                  node.type == 'StridedSlice' or node.type == 'Fill'or node.type == 'StringJoin' or node.type == 'SaveV2' or
+                  node.type == 'RestoreV2' or node.type == 'ShardedFilename' or
+                  node.type == 'MergeV2Checkpoints'):
                 pass
             else:
                 throw_error(ErrorTable.StageDetailsNotSupported, node.type)
-            if node.name == output_node_name:
+            if len(node.outputs) > 0 and strip_tensor_id(node.outputs[0].name) == output_node_name:
                 if node.type == 'Concat' or node.type == 'ConcatV2':
                     nodes = network.search_several(get_input(node.name)[0])
                     NetworkStage.concat(nodes)

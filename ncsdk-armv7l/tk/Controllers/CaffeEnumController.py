@@ -98,6 +98,22 @@ def isDepthwiseConvolution(layer, output_channels, input_channels):
         output_channels % input_channels == 0
 
 
+def isPermute(layer):
+    return layer in ["Permute"]
+
+
+def isNormalize(layer):
+    return layer in ["Normalize"]
+
+
+def isPriorBox(layer):
+    return layer in ["PriorBox"]
+
+
+def isDetectionOutput(layer):
+    return layer in ["DetectionOutput"]
+
+
 def get_caffe_op_type(layer, input_channels=1, output_channels=1):
     """
     Gets the relevant Toolkit Enum for the corresponding Caffe layer stage type.
@@ -151,5 +167,13 @@ def get_caffe_op_type(layer, input_channels=1, output_channels=1):
         return StageType.crop
     if isDepthwiseConvolution(layer, output_channels, input_channels):
         return StageType.depthwise_convolution
+    if isPermute(layer.type):
+        return StageType.permute
+    if isNormalize(layer.type):
+        return StageType.normalize
+    if isPriorBox(layer.type):
+        return StageType.prior_box
+    if isDetectionOutput(layer.type):
+        return StageType.detection_output
 
     throw_error(ErrorTable.StageTypeNotSupported, layer.type)

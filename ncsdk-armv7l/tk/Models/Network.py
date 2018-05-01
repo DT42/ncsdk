@@ -34,6 +34,8 @@ class Network:
         self.outputNeedsTransforming = False
         self.outputTensor = None
 
+        self.outputIsSsdDetOut = False
+
         self.inputTensor = data
         self.datatype = DataType.fp16
 
@@ -65,7 +67,8 @@ class Network:
                 self.count += 1
             elif len(stage.top) > 1:
                 appropriate_nodes = self.search_several(stage.top)
-                stage.attach_eltwise(appropriate_nodes)
+                #stage.attach_eltwise(appropriate_nodes)
+                stage.attach_multiple_bottoms(appropriate_nodes)
                 if debug:
                     print("attached.")
                 self.count += 1

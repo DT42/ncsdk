@@ -45,6 +45,7 @@ class ValidationStatistic(Enum):
     invalid = 3
     class_check_exact = 4
     class_check_broad = 5
+    ssd_pred_metric   = 6
 
 
 class MemoryIndex(Enum):
@@ -110,16 +111,25 @@ class StageType(Enum):
     myriadX_fully_connected_layer = 35
     myriadX_post_ops = 36
     convertHwSw = 37
-
+    permute = 38
+    normalize = 39
+    prior_box = 40
+    detection_output = 41
+    leaky_relu = 42
+    sum_reduce = 43
+    max_with_const = 44
+    rsqrt = 45
+    scale_with_scalar = 46
+ 
     # Unsupported Below this comment
-    dropout = 38
-    maxout = 39
-    normalization = 40
-    leaky_relu = 41
-    r_relu = 42
-    BNLL = 43
-    abs = 44
-    stochastic_pooling = 45
+    dropout = 47
+    maxout = 48
+    normalizaton = 49
+    r_relu = 50
+    BNLL = 51
+    abs = 52
+    stochastic_pooling = 53
+
 
 class StorageOrder(Enum):
     """
