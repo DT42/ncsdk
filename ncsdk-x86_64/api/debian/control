@@ -1,0 +1,38 @@
+Source: mvnc
+Section: python
+Priority: optional
+Maintainer: Bofu Chen <bofu@dt42.io>
+Build-Depends:
+ debhelper (>= 9.0.0),
+ python3 (>= 3.4),
+ python3-setuptools (>= 3.0),
+ python (>= 2.4),
+ python-setuptools (>= 2.4)
+Standards-Version: 3.9.5
+Homepage: https://github.com/movidius/ncsdk
+#Vcs-Git: git@gitlab.com:DT42/galaxy42/dt42-lab-lib.git
+#Vcs-Browser: http://git.debian.org/?p=collab-maint/dt42lab.git;a=summary
+
+Package: python-mvnc
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ncsdk
+Description: Intel Movidius Neural Compute SDK
+ This Intel Movidius Neural Compute software developer kit (NCSDK) is
+ provided for users of the Intel Movidius Neural Compute Stick (Intel
+ Movidius NCS). It includes software tools, an API, and examples, so
+ developers can create software that takes advantage of the accelerated
+ neural network capability provided by the Intel Movidius NCS hardware.
+ .
+ This package is Python API wrapper.
+
+Package: python3-mvnc
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ncsdk
+Description: Intel Movidius Neural Compute SDK
+ This Intel Movidius Neural Compute software developer kit (NCSDK) is
+ provided for users of the Intel Movidius Neural Compute Stick (Intel
+ Movidius NCS). It includes software tools, an API, and examples, so
+ developers can create software that takes advantage of the accelerated
+ neural network capability provided by the Intel Movidius NCS hardware.
+ .
+ This package is Python API wrapper.

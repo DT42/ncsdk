@@ -1,0 +1,11 @@
+mvnc (1.12.00.01-1) unstable; urgency=medium
+
+  * Update to v1.12.00.01.
+
+ -- Bofu Chen (bafu) <bofu@dt42.io>  Tue, 01 May 2018 23:35:10 +0800
+
+mvnc (1.10.01.00) experimental; urgency=low
+
+  * Initial Release.
+
+ -- Bofu Chen <bofu@dt42.io>  Sat, 05 Aug 2017 21:31:11 +0800
